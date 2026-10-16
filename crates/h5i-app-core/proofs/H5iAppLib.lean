@@ -19,3 +19,5 @@ import H5iAppLib.Decode
 import H5iAppLib.Authz
 import H5iAppLib.Bits
 import H5iAppLib.Graph
+import H5iAppLib.ReadOnly
+import H5iAppLib.Query

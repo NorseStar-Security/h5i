@@ -6,6 +6,13 @@
 //! key a command runs at most once; without one, a connection lost during
 //! `COMMIT` is reported as [`DbError::CommitUnknown`].
 //!
+//! A command the kernel declares read-only ([`Kernel::read_only`]) runs in a
+//! `SERIALIZABLE READ ONLY DEFERRABLE` transaction instead, without advisory
+//! locks: such a transaction waits for a snapshot that no serialization
+//! failure can invalidate, so it is never retried for one. Writes take the
+//! advisory locks [`Store::lock_for`] names before `BEGIN`; they only reduce
+//! retries, SERIALIZABLE alone makes the outcome serial.
+//!
 //! Stores see only an opaque [`Tx`], so app code cannot run its own SQL. Each
 //! attempt reads the [`Clock`] inside its transaction.
 //!
@@ -20,10 +27,13 @@
 pub mod migrate;
 pub mod outbox;
 mod roles;
+mod statements;
 mod table;
+#[cfg(test)]
+mod reads_test;
 
 pub use roles::{lockdown, lockdown_sql};
-pub use table::{column_of, create_tables, load_table, spec, store_writes, ColumnDef, Kind, PgField, Table, Value};
+pub use table::{column_of, count_read, create_index, create_tables, load_read, load_reads, load_table, load_tables, spec, store_writes, ColumnDef, Kind, PgField, Table, Value};
 pub use h5i_app_core::Timestamp;
 pub use h5i_app_sql as sql;
 pub use h5i_app_pgsql as pgsql;
@@ -39,7 +49,9 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{IsolationLevel, NoTls, Transaction};
 
 /// The transaction a `Store` works in. Offers only this crate's table operations.
-pub struct Tx<'a>(pub(crate) &'a Transaction<'a>);
+/// Its statements are prepared once per connection (deadpool's statement
+/// cache), at most `EngineConfig::statement_cache` of them.
+pub struct Tx<'a>(pub(crate) &'a deadpool_postgres::Transaction<'a>, pub(crate) &'a statements::Statements);
 
 impl Tx<'_> {
     /// Backend process id, so fault tests can kill this connection.
@@ -51,7 +63,7 @@ impl Tx<'_> {
 
 /// Opaque connection pool, so app code cannot take a raw connection.
 #[derive(Clone)]
-pub struct Pool(pub(crate) deadpool_postgres::Pool);
+pub struct Pool(pub(crate) deadpool_postgres::Pool, pub(crate) Arc<statements::Statements>);
 
 #[derive(Debug)]
 pub enum DbError {
@@ -133,14 +145,66 @@ pub trait Store<K: Kernel>: Send + Sync + 'static {
 
     fn load(tx: &Tx<'_>, tenant: TenantId) -> impl Future<Output = Result<K::Snapshot, DbError>> + Send;
 
-    /// The rows `cmd` reads. Load less than the whole tenant only with a frame theorem.
-    fn load_for(tx: &Tx<'_>, tenant: TenantId, cmd: &K::Command) -> impl Future<Output = Result<K::Snapshot, DbError>> + Send {
-        let _ = cmd;
+    /// The rows `cmd` reads when `actor` runs it. Load less than the whole
+    /// tenant only with a frame theorem: `transition` must give the same
+    /// result on what this returns as on `load`.
+    fn load_for(
+        tx: &Tx<'_>,
+        tenant: TenantId,
+        actor: &K::Principal,
+        cmd: &K::Command,
+    ) -> impl Future<Output = Result<K::Snapshot, DbError>> + Send {
+        let _ = (actor, cmd);
         Self::load(tx, tenant)
+    }
+
+    /// Advisory locks to hold while `cmd` runs, to queue conflicting writes
+    /// instead of retrying them. Only a performance hint: SERIALIZABLE makes
+    /// any choice correct. The default locks the whole tenant.
+    fn lock_for(actor: &K::Principal, cmd: &K::Command) -> Lock {
+        let _ = (actor, cmd);
+        Lock::Tenant
     }
 
     /// A later `load` must return `K::apply(before, ws)`.
     fn write(tx: &Tx<'_>, tenant: TenantId, ws: &K::WriteSet) -> impl Future<Output = Result<(), DbError>> + Send;
+}
+
+/// Advisory locks an engine takes before a write's `BEGIN` ([`Store::lock_for`]).
+///
+/// `Tenant` takes the tenant's lock exclusively. `Keys` takes it shared and
+/// then one exclusive lock per key (hashed with the tenant, sorted), so two
+/// commands queue only if they share a key or one of them locks the tenant.
+/// `None` takes nothing. Locks are always taken in that order, so they never
+/// deadlock. Without `EngineConfig::tenant_lock` nothing is locked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lock {
+    Tenant,
+    Keys(Vec<u64>),
+    None,
+}
+
+impl Lock {
+    /// A lock key from a tag (say, a table) and the bytes of a value.
+    pub fn key(tag: &str, value: &[u8]) -> u64 {
+        // FNV-1a: stable across processes and builds, unlike `DefaultHasher`.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in tag.as_bytes().iter().chain([0u8].iter()).chain(value.iter()) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+}
+
+/// The bigint advisory lock of `key` in `tenant`: negative, so it never
+/// meets a tenant's own lock (the tenant id).
+fn key_lock(tenant: TenantId, key: u64) -> i64 {
+    let mut x = tenant.0 ^ key.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x | (1 << 63)) as i64
 }
 
 /// Needed to replay stored replies for idempotency keys.
@@ -205,18 +269,29 @@ impl ManualClock {
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub max_attempts: u32,
-    /// Advisory lock per tenant. Only reduces retries; SERIALIZABLE gives correctness.
+    /// Advisory locks for writes, as [`Store::lock_for`] names them. Only
+    /// reduces retries; SERIALIZABLE gives correctness. Off: no locks at all.
     pub tenant_lock: bool,
     /// Where each attempt reads the time.
     pub clock: Clock,
     /// Never let time go back in commit order within a tenant (via `h5i_clock`).
     /// Costs a read per attempt and a write per commit.
     pub monotonic: bool,
+    /// Prepared statements kept per connection; the least recently used is
+    /// closed beyond this. Applies to the engine's pool (shared with every
+    /// engine on a clone of it).
+    pub statement_cache: usize,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        EngineConfig { max_attempts: 20, tenant_lock: true, clock: Clock::System, monotonic: false }
+        EngineConfig {
+            max_attempts: 20,
+            tenant_lock: true,
+            clock: Clock::System,
+            monotonic: false,
+            statement_cache: statements::DEFAULT_CAPACITY,
+        }
     }
 }
 
@@ -233,6 +308,8 @@ pub struct EngineStats {
     pub retries: AtomicU64,
     pub commits: AtomicU64,
     pub replays: AtomicU64,
+    /// Requests run on the read-only path (also counted in `attempts`).
+    pub reads: AtomicU64,
 }
 
 pub struct Engine<K: Kernel, S: Store<K>> {
@@ -254,7 +331,9 @@ pub fn pool(url: &str, max_size: usize) -> Result<Pool, DbError> {
     let mut cfg = Config::new();
     cfg.url = Some(url.to_string());
     cfg.pool = Some(deadpool_postgres::PoolConfig::new(max_size));
-    cfg.create_pool(Some(Runtime::Tokio1), NoTls).map(Pool).map_err(|e| DbError::Pool(e.to_string()))
+    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+        .map(|p| Pool(p, Arc::new(statements::Statements::new(statements::DEFAULT_CAPACITY))))
+        .map_err(|e| DbError::Pool(e.to_string()))
 }
 
 struct Idem<'a, K: Kernel> {
@@ -271,6 +350,7 @@ enum Attempt<K: Kernel> {
 
 impl<K: Kernel, S: Store<K>> Engine<K, S> {
     pub fn new(pool: Pool, config: EngineConfig) -> Self {
+        pool.1.set_capacity(config.statement_cache);
         Engine { pool, config, stats: EngineStats::default(), _marker: PhantomData }
     }
 
@@ -311,16 +391,17 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
     pub async fn snapshot(&self, tenant: TenantId) -> Result<K::Snapshot, DbError> {
         let mut client = self.pool.0.get().await.map_err(|e| DbError::Pool(e.to_string()))?;
         let tx = client.build_transaction().isolation_level(IsolationLevel::Serializable).read_only(true).deferrable(true).start().await?;
-        let snap = S::load(&Tx(&tx), tenant).await?;
+        let snap = S::load(&Tx(&tx, &self.pool.1), tenant).await?;
         tx.commit().await?;
         Ok(snap)
     }
 
-    /// What `cmd` would read for this tenant, for tests of `Store::load_for`.
-    pub async fn snapshot_for(&self, tenant: TenantId, cmd: &K::Command) -> Result<K::Snapshot, DbError> {
+    /// What `cmd` would read for `actor`, for tests of `Store::load_for`.
+    pub async fn snapshot_for(&self, actor: &K::Principal, cmd: &K::Command) -> Result<K::Snapshot, DbError> {
+        let tenant = K::tenant(actor);
         let mut client = self.pool.0.get().await.map_err(|e| DbError::Pool(e.to_string()))?;
         let tx = client.build_transaction().isolation_level(IsolationLevel::Serializable).read_only(true).deferrable(true).start().await?;
-        let snap = S::load_for(&Tx(&tx), tenant, cmd).await?;
+        let snap = S::load_for(&Tx(&tx, &self.pool.1), tenant, actor, cmd).await?;
         tx.commit().await?;
         Ok(snap)
     }
@@ -351,17 +432,25 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
     }
 
     async fn run(&self, actor: &K::Principal, cmd: &K::Command, idem: Option<Idem<'_, K>>) -> Result<Result<K::Reply, K::Error>, DbError> {
+        // With a key the reply is stored, which is a write.
+        if idem.is_none() && K::read_only(cmd) {
+            return self.run_read(actor, cmd).await;
+        }
         let tenant = K::tenant(actor);
+        let lock = if self.config.tenant_lock { S::lock_for(actor, cmd) } else { Lock::None };
         for attempt in 0..self.config.max_attempts {
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             let mut client = self.pool.0.get().await.map_err(|e| DbError::Pool(e.to_string()))?;
-            let result = match self.lock(&client, tenant).await {
+            let result = match self.lock(&client, tenant, &lock).await {
                 Ok(()) => {
                     let r = self.attempt(&mut client, tenant, actor, cmd, idem.as_ref()).await;
-                    self.unlock(&client, tenant).await;
+                    self.unlock(&client, &lock).await;
                     r
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    self.unlock(&client, &lock).await;
+                    Err(e)
+                }
             };
             match result {
                 Ok(Attempt::Done(r)) => {
@@ -390,19 +479,93 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
         Err(DbError::RetriesExhausted)
     }
 
-    /// Taken before BEGIN so the snapshot is read after the wait.
-    async fn lock(&self, client: &deadpool_postgres::Object, tenant: TenantId) -> Result<(), DbError> {
-        if self.config.tenant_lock {
-            client.execute("SELECT pg_advisory_lock($1)", &[&table::tenant_param(tenant)?]).await?;
+    /// Taken before BEGIN so the snapshot is read after the wait. Tenant
+    /// first, then keys in ascending order: one global order, so no deadlock.
+    async fn lock(&self, client: &deadpool_postgres::Object, tenant: TenantId, lock: &Lock) -> Result<(), DbError> {
+        match lock {
+            Lock::None => {}
+            Lock::Tenant => {
+                client.execute("SELECT pg_advisory_lock($1)", &[&table::tenant_param(tenant)?]).await?;
+            }
+            Lock::Keys(keys) => {
+                client.execute("SELECT pg_advisory_lock_shared($1)", &[&table::tenant_param(tenant)?]).await?;
+                let mut ids: Vec<i64> = keys.iter().map(|k| key_lock(tenant, *k)).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                for id in ids {
+                    client.execute("SELECT pg_advisory_lock($1)", &[&id]).await?;
+                }
+            }
         }
         Ok(())
     }
 
-    async fn unlock(&self, client: &deadpool_postgres::Object, tenant: TenantId) {
-        if self.config.tenant_lock
-            && let Ok(tid) = table::tenant_param(tenant)
-        {
-            let _ = client.execute("SELECT pg_advisory_unlock($1)", &[&tid]).await;
+    /// Releases every session-level advisory lock this connection holds.
+    async fn unlock(&self, client: &deadpool_postgres::Object, lock: &Lock) {
+        if *lock != Lock::None {
+            let _ = client.execute("SELECT pg_advisory_unlock_all()", &[]).await;
+        }
+    }
+
+    /// A read-only command: no advisory lock, a `SERIALIZABLE READ ONLY
+    /// DEFERRABLE` transaction, retried only when the connection drops.
+    async fn run_read(&self, actor: &K::Principal, cmd: &K::Command) -> Result<Result<K::Reply, K::Error>, DbError> {
+        let tenant = K::tenant(actor);
+        for attempt in 0..self.config.max_attempts {
+            self.stats.attempts.fetch_add(1, Ordering::Relaxed);
+            self.stats.reads.fetch_add(1, Ordering::Relaxed);
+            let mut client = self.pool.0.get().await.map_err(|e| DbError::Pool(e.to_string()))?;
+            match self.read_attempt(&mut client, tenant, actor, cmd).await {
+                Ok(r) => {
+                    if r.is_ok() {
+                        self.stats.commits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(r);
+                }
+                // Nothing was written, so rerunning is always safe.
+                Err(e) if e.is_retryable() => {
+                    self.stats.retries.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(attempt, error = %e, "retrying read-only transaction");
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(DbError::RetriesExhausted)
+    }
+
+    async fn read_attempt(
+        &self,
+        client: &mut deadpool_postgres::Object,
+        tenant: TenantId,
+        actor: &K::Principal,
+        cmd: &K::Command,
+    ) -> Result<Result<K::Reply, K::Error>, DbError> {
+        let tid = table::tenant_param(tenant)?;
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .read_only(true)
+            .deferrable(true)
+            .start()
+            .await?;
+        let now = self.read_clock(&tx, tid).await?;
+        let snap = S::load_for(&Tx(&tx, &self.pool.1), tenant, actor, cmd).await?;
+        let mut actor = actor.clone();
+        K::stamp(&mut actor, now);
+        match K::transition(&actor, &snap, cmd) {
+            Err(refusal) => {
+                tx.rollback().await?;
+                Ok(Err(refusal))
+            }
+            Ok((ws, reply)) => {
+                // Empty by `H5iAppLib.ReadOnly.Sound`. Were it not, PostgreSQL
+                // refuses the write in this READ ONLY transaction and the
+                // request fails rather than losing it.
+                S::write(&Tx(&tx, &self.pool.1), tenant, &ws).await?;
+                tx.commit().await?;
+                Ok(Ok(reply))
+            }
         }
     }
 
@@ -432,7 +595,7 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
                 return Ok(Attempt::Replayed(reply));
             }
         }
-        let snap = S::load_for(&Tx(&tx), tenant, cmd).await?;
+        let snap = S::load_for(&Tx(&tx, &self.pool.1), tenant, actor, cmd).await?;
         let mut actor = actor.clone();
         K::stamp(&mut actor, now);
         let decision = K::transition(&actor, &snap, cmd);
@@ -447,7 +610,7 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
                 Ok(Attempt::Done(Err(refusal)))
             }
             Ok((ws, reply)) => {
-                S::write(&Tx(&tx), tenant, &ws).await?;
+                S::write(&Tx(&tx, &self.pool.1), tenant, &ws).await?;
                 if let (Some(idem), Some(bytes)) = (idem, &encoded) {
                     tx.execute(
                         "INSERT INTO h5i_idempotency (tenant_id, key, fingerprint, reply) VALUES ($1, $2, $3, $4)",
@@ -502,4 +665,28 @@ fn backoff(attempt: u32) -> Duration {
     let cap_ms = 1u64 << attempt.min(8);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     Duration::from_micros(u64::from(nanos) % (cap_ms * 1000) + 100)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn key_locks_stay_out_of_tenant_locks() {
+        for t in [0u64, 1, 7, u64::MAX] {
+            for k in [0u64, 1, Lock::key("article", b"a"), u64::MAX] {
+                // Tenant locks are the (non-negative) tenant ids.
+                assert!(key_lock(TenantId(t), k) < 0);
+            }
+        }
+        assert_ne!(key_lock(TenantId(1), 5), key_lock(TenantId(2), 5));
+        assert_ne!(key_lock(TenantId(1), 5), key_lock(TenantId(1), 6));
+    }
+
+    #[test]
+    fn lock_keys_are_stable() {
+        // Two servers must agree on a key, so it may not depend on the process.
+        assert_eq!(Lock::key("article", b"hello"), 0xe58c_2868_5d42_b9e9);
+        assert_ne!(Lock::key("article", b"x"), Lock::key("articlex", b""));
+    }
 }
