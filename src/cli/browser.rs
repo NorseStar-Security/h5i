@@ -2475,13 +2475,45 @@ fn host_proxy_chromium_tls() -> anyhow::Result<bs::ChromiumTls> {
 /// stops Chromium bypassing the proxy for localhost, which it does by default
 /// and which otherwise hides a dev-server target from capture entirely.
 fn agent_browser_proxy_args(proxy_url: &str) -> Vec<String> {
+    agent_browser_proxy_args_with(proxy_url, std::env::var("AGENT_BROWSER_ARGS").ok().as_deref())
+}
+
+/// Build the agent-browser launch flags for a proxy session. `extra` is what
+/// the caller put in AGENT_BROWSER_ARGS: it is merged into the single `--args`
+/// launch string, since passing `--args` explicitly would otherwise shadow that
+/// env var. This is how a `--no-sandbox` from the sandbox hint reaches a
+/// `proxy-open` launch, while the loopback bypass (so a localhost target is
+/// still captured) is always kept.
+fn agent_browser_proxy_args_with(proxy_url: &str, extra: Option<&str>) -> Vec<String> {
+    let mut launch = String::from("--proxy-bypass-list=<-loopback>");
+    if let Some(extra) = extra {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            launch.push(',');
+            launch.push_str(extra);
+        }
+    }
     vec![
         "--proxy".into(),
         proxy_url.into(),
         "--ignore-https-errors".into(),
         "--args".into(),
-        "--proxy-bypass-list=<-loopback>".into(),
+        launch,
     ]
+}
+
+/// The environment that points every agent-browser launch from a shell at this
+/// proxy. The printed `start` line carries the flags for that one launch only:
+/// when agent-browser's daemon idles out and a later bare command relaunches
+/// it, the new browser is not proxied, the page keeps working, and capture
+/// stops without a word. With these variables exported, a relaunch is
+/// proxied too.
+fn agent_browser_proxy_env(proxy_url: &str) -> String {
+    format!(
+        "export AGENT_BROWSER_PROXY={} AGENT_BROWSER_IGNORE_HTTPS_ERRORS=1 AGENT_BROWSER_ARGS={}",
+        shell_word_if_needed(proxy_url),
+        shell_word_if_needed("--proxy-bypass-list=<-loopback>")
+    )
 }
 
 /// The shell line a person copies to point agent-browser at this proxy.
@@ -2684,6 +2716,12 @@ fn start_proxy(
             "  start    : {}",
             agent_browser_open_line(&agent_browser.to_string_lossy(), &proxy_url, &url)
         );
+        println!("  env      : {}", agent_browser_proxy_env(&proxy_url));
+        println!(
+            "             export these first, so a relaunched agent-browser (its daemon \
+             restarts when idle) is proxied too; otherwise capture stops silently"
+        );
+        println!("  or       : h5i browser proxy-open <url> (passes the proxy on every launch)");
         println!("  login    : agent-browser dashboard start");
         println!("  inspect  : h5i websec requests");
     }
@@ -2708,6 +2746,23 @@ fn close_proxy_browser(id: &str) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// When Chromium fails to start its sandbox — common where there is no root to
+/// make `chrome-sandbox` setuid and the namespace sandbox is unavailable — the
+/// fix is to launch it without the sandbox. h5i does not add `--no-sandbox`
+/// itself (it turns Chromium's sandbox off), so it points the way instead.
+fn sandbox_hint(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("no usable sandbox") || lower.contains("sandboxhelper") || lower.contains("setuid sandbox") {
+        "\n\nChromium could not start its sandbox (usual without root). Retry with the sandbox \
+         off: `AGENT_BROWSER_ARGS=--no-sandbox h5i browser proxy-open <url>`, or run agent-browser \
+         yourself with `--args --no-sandbox`. This disables Chromium's sandbox, so use it only for \
+         a target you trust."
+            .to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -2739,8 +2794,9 @@ fn proxy_open(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "agent-browser could not open {url}: {}",
-            bs::scrub_text(stderr.trim())
+            "agent-browser could not open {url}: {}{}",
+            bs::scrub_text(stderr.trim()),
+            sandbox_hint(&stderr),
         );
     }
     if json_out {
@@ -5112,6 +5168,50 @@ fn status(root: &Path, selector: Option<&str>, json: bool) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Past this, a live proxy session that has captured nothing from its targets is
+/// worth a warning: the usual cause is a browser that is no longer proxied.
+const PROXY_QUIET_SECS: i64 = 300;
+
+/// When the proxy last let a request through, from the end of the receipts.
+/// Denied requests do not count: Chromium's own background traffic keeps
+/// arriving (and being refused) whether or not the target's does.
+fn last_allowed_request(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().rev().find_map(|line| {
+        let record: Value = serde_json::from_str(line).ok()?;
+        if record.get("allowed").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let at = record.get("at").and_then(Value::as_str)?;
+        chrono::DateTime::parse_from_rfc3339(at)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc))
+    })
+}
+
+/// How long ago a proxy session last captured a target request, and a warning
+/// with the fix when that is long enough to mean capture has stopped.
+fn print_proxy_capture_age(session: &bs::Session, proxy_url: &str) {
+    let Some(path) = &session.logs.requests else { return };
+    match last_allowed_request(path) {
+        None => println!("  last     : no target request captured yet"),
+        Some(at) => {
+            let secs = (chrono::Utc::now() - at).num_seconds().max(0);
+            if secs < PROXY_QUIET_SECS {
+                println!("  last     : target request captured {secs}s ago");
+            } else {
+                println!(
+                    "  last     : {} — if the browser is still in use it is no longer going \
+                     through this proxy (a relaunched agent-browser without the proxy \
+                     settings). Export them and relaunch: {}",
+                    style(format!("nothing captured for {}m", secs / 60)).yellow(),
+                    agent_browser_proxy_env(proxy_url)
+                );
+            }
+        }
+    }
+}
+
 fn print_summary(session: &bs::Session) {
     println!("  url      : {}", session.url);
     // One sentence, from the record, so the summary and the audit cannot say
@@ -5150,6 +5250,9 @@ fn print_summary(session: &bs::Session) {
             "  tls      : {} — Chromium accepts every certificate error for this session",
             style("ignore-https-errors").yellow()
         );
+    }
+    if let (Some(proxy), bs::State::Live) = (&session.proxy, &session.state) {
+        print_proxy_capture_age(session, &proxy.url);
     }
     if let Some(project) = &session.project {
         println!("  project  : {project}");
@@ -5848,6 +5951,49 @@ mod tests {
             loading.contains("h5i browser read"),
             "and what to do instead: {loading}"
         );
+    }
+
+    #[test]
+    fn a_sandbox_failure_points_at_no_sandbox_and_proxy_open_honours_it() {
+        assert!(sandbox_hint("[FATAL] No usable sandbox! If you are running on Ubuntu")
+            .contains("--no-sandbox"));
+        assert!(sandbox_hint("some other failure").is_empty());
+        // The AGENT_BROWSER_ARGS value the hint names reaches a proxy-open
+        // launch (it would be shadowed if --args were passed alone), while the
+        // loopback bypass is always kept.
+        let args = agent_browser_proxy_args_with("http://127.0.0.1:9", Some("--no-sandbox"));
+        let launch = args.last().unwrap();
+        assert!(launch.contains("--proxy-bypass-list=<-loopback>"), "{launch}");
+        assert!(launch.contains("--no-sandbox"), "{launch}");
+        // With nothing set, only the loopback bypass is present.
+        let bare = agent_browser_proxy_args_with("http://127.0.0.1:9", None);
+        assert_eq!(bare.last().unwrap(), "--proxy-bypass-list=<-loopback>");
+    }
+
+    #[test]
+    fn the_printed_environment_keeps_a_relaunched_agent_browser_proxied() {
+        let env = agent_browser_proxy_env("http://127.0.0.1:9");
+        assert_eq!(
+            env,
+            "export AGENT_BROWSER_PROXY=http://127.0.0.1:9 AGENT_BROWSER_IGNORE_HTTPS_ERRORS=1 \
+             AGENT_BROWSER_ARGS='--proxy-bypass-list=<-loopback>'"
+        );
+    }
+
+    #[test]
+    fn the_last_capture_counts_only_requests_the_proxy_let_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.jsonl");
+        std::fs::write(
+            &path,
+            "{\"seq\":1,\"at\":\"2026-10-16T10:00:00Z\",\"allowed\":true}\n\
+             {\"seq\":2,\"at\":\"2026-10-16T11:00:00Z\",\"allowed\":false}\n",
+        )
+        .unwrap();
+        let at = last_allowed_request(&path).unwrap();
+        assert_eq!(at.to_rfc3339(), "2026-10-16T10:00:00+00:00");
+        std::fs::write(&path, "").unwrap();
+        assert!(last_allowed_request(&path).is_none());
     }
 
     #[test]
