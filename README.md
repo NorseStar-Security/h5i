@@ -1,38 +1,32 @@
- <p align="center">
-  <a href="https://h5i.dev/" target="_blank">
-    <img src="./docs/_static/logo.png" alt="h5i logo" height="126">
-  </a>
-</p>
+# h5i
 
-<p align="center">
+<p align="left">
   <a href="https://github.com/h5i-dev/h5i/actions/workflows/test.yaml"><img alt="tests" src="https://github.com/h5i-dev/h5i/actions/workflows/test.yaml/badge.svg"></a>
-  <a href="https://github.com/h5i-dev/h5i/blob/main/LICENSE"><img alt="Apache-2.0" src="https://img.shields.io/github/license/h5i-dev/h5i?color=blue"></a>
   <a href="https://github.com/h5i-dev/h5i/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/h5i-dev/h5i?style=social"></a>
   <a href="https://github.com/h5i-dev/h5i/releases"><img alt="release" src="https://img.shields.io/github/v/release/h5i-dev/h5i?label=release"></a>
+  <a href="https://crates.io/crates/h5i-app"><img alt="release" src="https://img.shields.io/crates/v/h5i-app"></a>
 </p>
 
-<h1 align="center">Build, Hack, and Verify Web Apps</h1>
+**h5i** (pronounced *high-five*) unifies web development, security testing, and formal verification around a composable axum-based Rust framework. Its kernel-based architecture enables Lean 4 verification and optional GPU acceleration, while its built-in red-teaming and CI/CD toolkit enables automated vulnerability discovery.
 
-**h5i** (pronounced *high-five*) is a workspace for securing web applications through two complementary approaches: **finding vulnerabilities** with AI agents and **proving correctness** with formal verification.
-
-- **Find Bugs (Red-Teaming):** Give AI agents a unified toolkit for browser automation, HTTP traffic manipulation, and reconnaissance. Test existing web applications for vulnerabilities, reproduce attacks, and run security regression checks in CI/CD.
-- **Prove Correctness (Formal Verification):** Build applications with `h5i-app`, an Axum-based Rust framework designed for verification with Lean 4. Prove authorization, data isolation, and business logic properties directly against your Rust implementation.
-
-**Build with agents. Red-team for bugs. Formally verify properties.**
+> h5i's CLI-based red-teaming tools are framework-independent and agent-friendly. They can test any website or web application, including existing projects, without adopting `h5i-app`.
 
 ```bash
-# Find bugs in web applications
+# Build and verify a Rust web application
+h5i app new counter && cd counter                       # Create an h5i-app project
+h5i app extract                                         # Translate Rust logic into Lean 4
+h5i app prove                                           # Build and check formal proofs
+h5i app mutate                                          # Test proof sensitivity with mutations
+
+# Red-team any web application
 h5i browser open https://example.com                    # Open a website in the browser
 h5i browser click @e3                                   # Interact with page elements
 h5i websec requests                                     # Inspect captured HTTP traffic
 h5i websec replay req_42 --set query.id=456             # Modify and replay a request
 h5i recon crawl --max-requests 200                      # Crawl the application for attack surfaces
 
-# Prove correctness of Rust application logic
-h5i app new counter && cd counter                       # Create an h5i-app project
-h5i app extract                                         # Translate Rust logic into Lean 4
-h5i app prove                                           # Build and check formal proofs
-h5i app mutate                                          # Test proof sensitivity with mutations
+# Run security regression tests in CI/CD
+h5i test .h5i-tests/tests/auth.yaml --target https://staging.example.com  # Replay a security test
 ```
 
 <a href="https://trendshift.io/repositories/46160?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-46160" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/46160/daily?language=Rust" alt="h5i on Trendshift" width="250" height="55"/></a> 
@@ -57,11 +51,29 @@ npx skills add h5i-dev/h5i         # if you do not have the binary yet
 
 ---
 
-## 2. Find Bugs: Red-Team with Agents
+## 2. Build, Verify & Test
+
+### Verifiable Web Framework
+
+[`h5i-app`](crates/h5i-app/README.md) is an Axum-based Rust web framework that makes application logic amenable to Lean 4.
+
+```toml
+[dependencies]
+h5i-app = { version = "0.1.1", features = ["http", "postgres"] }
+```
+
+We can write web applications in Rust, translate them into Lean 4 via [Aeneas](https://github.com/AeneasVerif/aeneas), and prove various properties like authorization, 
+isolation, business logics, and more.
+
+<p align="center">
+  <img src="./docs/_static/calculator-rust-lean-proof.svg" alt="Watching a sandboxed browser session from the host" width="99%" />
+</p>
+
+### Security Testing: Red-Teaming & CI/CD
 
 Let AI agents explore, attack, and test web applications using h5i's integrated security toolkit. 
 
-> `h5i` works with any web services regardless of their framework, and no migration to `h5i-app` is required.
+> `h5i` CLI works with any web services regardless of their framework, and no migration to `h5i-app` is required.
 
 - **Browser automation:** Navigate applications, interact with forms, and test authenticated workflows.
 - **HTTP security testing:** Capture, modify, replay, and compare HTTP requests to investigate vulnerabilities.
@@ -77,25 +89,7 @@ Let AI agents explore, attack, and test web applications using h5i's integrated 
 
 ---
 
-## 3. Prove Correctness: Build on h5i-app
-
-[`h5i-app`](crates/h5i-app/README.md) is an Axum-based Rust web framework that makes application logic amenable to Lean 4.
-
-> Red-teaming discovers bugs through testing. Formal verification takes a complementary approach: proving that specified properties hold for all possible inputs and behaviors.
-
-```toml
-[dependencies]
-h5i-app = { version = "0.1.1", features = ["http", "postgres"] }
-```
-
-We can write web applications in Rust, translate them into Lean 4 via [Aeneas](https://github.com/AeneasVerif/aeneas), and prove various properties like authorization, 
-isolation, business logics, and more.
-
-<p align="center">
-  <img src="./docs/_static/calculator-rust-lean-proof.svg" alt="Watching a sandboxed browser session from the host" width="99%" />
-</p>
-
-## 4. Dashboard
+## 3. Dashboard
 
 While agents access these capabilities through a unified CLI, you can also monitor their activity through the dashboard:
 
@@ -109,23 +103,23 @@ h5i ui    # Open the local dashboard
 
 ---
 
-## 5. Documentation
+## 4. Showcase
 
-- [Official Website](https://h5i.dev/): project overview, [Slides](https://h5i.dev/pitch/)
-- [MANUAL.md](docs/MANUAL.md) / `man h5i`: full command reference
-- [CONTRIBUTING.md](CONTRIBUTING.md): we welcome contributions of any kind
-- `curl -fsSL https://h5i.dev/man/man1/h5i.1 -o ~/.local/share/man/man1/h5i.1`: install the man page
+**Web Applications**
+- [o5s](https://github.com/h5i-dev/o5s): Patch-based version control for concurrent AI agents, deployable on Cloudflare Workers.
+- [h5i-db](https://github.com/Koukyosyumei/h5i-db): High-performance time-series database and backtesting engine with an `h5i-app`-based web interface.
+
+**Benchmarks**
+- [h5i-app-bench](https://github.com/h5i-dev/h5i-app-bench): Benchmarks for formal verification coverage and web application performance across languages.
+- [h5i-websec-bench](https://github.com/h5i-dev/h5i-websec-bench): AI-driven penetration testing benchmarks using public CTF challenges.
+
+**Selected Vulnerabilities**
+- [rustical GHSA-9cp5-7crm-9cf7](https://github.com/lennart-k/rustical/security/advisories/GHSA-9cp5-7crm-9cf7): Missing authorization checks allowed cross-user object deletion.
+- [Exograph #2320](https://github.com/exograph/exograph/issues/2320): Access-control bypass when protected fields were omitted during record creation.
+- [OxiCloud #796](https://github.com/AtalayaLabs/OxiCloud/pull/796): IDOR vulnerability exposing other users' file metadata through music playlists.
 
 ---
 
-## 6. License
+## 5. License
 
 h5i is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
-
----
-
-## 7. Contributors
-
-<a href="https://github.com/h5i-dev/h5i/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=h5i-dev/h5i" alt="h5i contributors" />
-</a>
