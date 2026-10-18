@@ -3,10 +3,12 @@
 //! Not extracted to Lean: `compile_read` is checked by differential tests
 //! (`crates/h5i-app-pg/src/reads_test.rs`) against `h5i_app_sql::eval`, which
 //! mirrors `H5iAppLib.Query`. The checks below are what makes the SQL mean
-//! what the Lean says: `IN` only between `NOT NULL` columns (so SQL's `NULL`
-//! rules never apply), windows only on tables whose key columns are all
-//! integers or booleans (so the key order is not a collation's), and the
-//! result always sorted by key ascending.
+//! what the Lean says: membership only between `NOT NULL` columns, windows
+//! only on tables whose key columns are all integers or booleans (so the key
+//! order is not a collation's), and the result always sorted by key ascending.
+//! In opt-in ScalarWhenUnique mode, a lookup fixed by its entire PK uses `=`;
+//! its empty-result UNKNOWN selects the same rows as FALSE in this positive
+//! AND/OR language. Adding negation would require revisiting that rewrite.
 
 use super::{has_kind, push_lit, push_name, tenant_col, valid, Kind, Table};
 use h5i_app_sql::{Pred, Read, Val, Window};
@@ -24,8 +26,21 @@ pub struct ReadQuery {
     pub params: Vec<Val>,
 }
 
+/// SQL spelling for membership predicates. Both modes preserve the same read
+/// and exact-count semantics; their PostgreSQL execution plans can differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadSqlMode {
+    /// Always use `IN (SELECT ...)`, retaining the original renderer behavior.
+    #[default]
+    Membership,
+    /// Use scalar `= (SELECT ...)` when all primary-key columns are fixed.
+    /// Other lookups retain `IN`. This is workload-dependent, not always faster.
+    ScalarWhenUnique,
+}
+
 struct Out<'a> {
     tables: &'a Vec<Table>,
+    mode: ReadSqlMode,
     text: Vec<u8>,
     params: Vec<Val>,
 }
@@ -37,6 +52,23 @@ fn windowed(w: &Window) -> bool {
 /// A column that never holds `NULL`: a key column or a non-nullable one.
 fn not_null(t: &Table, i: usize) -> bool {
     i < t.key_len as usize || !t.columns[i].nullable
+}
+
+/// A conjunction fixes this key column to one value. Disjunctions and
+/// membership predicates are deliberately not used to infer uniqueness.
+fn fixes_column(p: &Pred, key: u32) -> bool {
+    match p {
+        Pred::Eq { col, .. } => *col == key,
+        Pred::And(a, b) => fixes_column(a, key) || fixes_column(b, key),
+        _ => false,
+    }
+}
+
+/// Every SELECT is already restricted to one tenant. Fixing the remaining
+/// primary-key columns therefore leaves at most one row; a window cannot
+/// increase that cardinality. With no key columns the tenant itself is the PK.
+fn at_most_one(t: &Table, p: &Pred) -> bool {
+    (0..t.key_len).all(|key| fixes_column(p, key))
 }
 
 fn ordered_key(t: &Table) -> bool {
@@ -135,7 +167,13 @@ impl Out<'_> {
                     return None;
                 }
                 self.col(alias, &c.name.clone());
-                self.lit(" IN (");
+                // An uncorrelated scalar lookup is evaluated once (an InitPlan)
+                // instead of joining every outer row to the lookup table. Only
+                // use it when the schema's PK proves there cannot be two rows.
+                // Both columns are NOT NULL. On an empty subquery `=` yields
+                // UNKNOWN rather than IN's FALSE; these are interchangeable in
+                // this positive AND/OR predicate language's WHERE selection.
+                self.lit(if self.mode == ReadSqlMode::ScalarWhenUnique && at_most_one(sub, pred) { " = (" } else { " IN (" });
                 self.select(*table, pred, window, &[j], alias + 1, false)?;
                 self.lit(")");
             }
@@ -157,12 +195,18 @@ impl Out<'_> {
 /// invalid schema, a missing table or column, a value of the wrong type, `IN`
 /// on a nullable column, or a window on a table without an integer key.
 pub fn compile_read(tables: &Vec<Table>, tenant: i64, q: &Read, count: bool) -> Option<ReadQuery> {
+    compile_read_with_mode(tables, tenant, q, count, ReadSqlMode::default())
+}
+
+/// Compile a read or exact count with an explicit SQL strategy. The mode
+/// applies recursively to nested membership predicates; validation is identical.
+pub fn compile_read_with_mode(tables: &Vec<Table>, tenant: i64, q: &Read, count: bool, mode: ReadSqlMode) -> Option<ReadQuery> {
     if !valid(tables) {
         return None;
     }
     let t = tables.get(q.table as usize)?;
     let all: Vec<usize> = (0..t.columns.len()).collect();
-    let mut out = Out { tables, text: Vec::new(), params: vec![Val::Int(tenant)] };
+    let mut out = Out { tables, mode, text: Vec::new(), params: vec![Val::Int(tenant)] };
     let desc = q.window.desc && windowed(&q.window);
     if count {
         out.lit("SELECT count(*) FROM (");
@@ -271,6 +315,42 @@ mod tests {
         assert_eq!(compile_read(&schema(), 9, &other, false).unwrap().text, c.text);
         let n = compile_read(&schema(), 7, &q, true).unwrap();
         assert!(text(&n).starts_with("SELECT count(*) FROM (SELECT q0."));
+    }
+
+    #[test]
+    fn scalar_membership_requires_the_entire_primary_key() {
+        let eq = |col| Pred::Eq { col, val: Val::Int(1) };
+        let s = schema();
+        assert!(at_most_one(&s[0], &eq(0)));
+        assert!(!at_most_one(&s[0], &eq(1)));
+        assert!(!at_most_one(&s[1], &eq(0)));
+        assert!(at_most_one(&s[1], &Pred::And(Box::new(eq(0)), Box::new(eq(1)))));
+        assert!(!at_most_one(&s[0], &Pred::Or(Box::new(eq(0)), Box::new(eq(0)))));
+        let singleton = Table { name: b"counter".to_vec(), columns: vec![col("value", Kind::Int, false)], key_len: 0 };
+        assert!(at_most_one(&singleton, &Pred::All));
+    }
+
+    #[test]
+    fn modes_preserve_parameters_and_default_to_membership() {
+        let q = Read { table: 0, pred: Pred::In {
+            col: 1, table: 0, pred: Box::new(Pred::Eq { col: 0, val: Val::Int(1) }),
+            of: 1, window: whole(),
+        }, window: whole() };
+        assert_eq!(ReadSqlMode::default(), ReadSqlMode::Membership);
+        for count in [false, true] {
+            let old = compile_read(&schema(), 7, &q, count).unwrap();
+            let member = compile_read_with_mode(&schema(), 7, &q, count, ReadSqlMode::Membership).unwrap();
+            let scalar = compile_read_with_mode(&schema(), 7, &q, count, ReadSqlMode::ScalarWhenUnique).unwrap();
+            assert_eq!(old, member);
+            assert!(text(&member).contains(" IN (SELECT"));
+            assert_eq!(text(&member).replace(" IN (SELECT", " = (SELECT"), text(&scalar));
+            assert_eq!(member.params, scalar.params);
+        }
+        // A nonunique lookup must keep IN even in scalar mode.
+        let mut multi = q.clone();
+        if let Pred::In { pred, .. } = &mut multi.pred { **pred = Pred::All; }
+        assert_eq!(compile_read(&schema(), 7, &multi, false),
+            compile_read_with_mode(&schema(), 7, &multi, false, ReadSqlMode::ScalarWhenUnique));
     }
 
     #[test]
