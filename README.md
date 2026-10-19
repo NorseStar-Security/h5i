@@ -19,14 +19,19 @@ h5i app prove                                           # Build and check formal
 h5i app mutate                                          # Test proof sensitivity with mutations
 
 # Red-team any web application
-h5i browser open https://example.com                    # Open a website in the browser
+h5i browser open https://example.com                    # Open a website in Chromium, captured by h5i
 h5i browser click @e3                                   # Interact with page elements
 h5i websec requests                                     # Inspect captured HTTP traffic
 h5i websec replay req_42 --set query.id=456             # Modify and replay a request
 h5i recon crawl --max-requests 200                      # Crawl the application for attack surfaces
 
 # Run security regression tests in CI/CD
-h5i test .h5i-tests/tests/auth.yaml --target https://staging.example.com  # Replay a security test
+h5i test .h5i-tests/tests/auth.yaml --target https://staging.example.com                # Replay a security test
+h5i test --target https://staging.example.com --openapi openapi.yaml --min-coverage 80  # Fail CI when API coverage drops
+
+# Develop and red-team inside a disposable sandbox
+h5i box --name lab --profile browser && h5i box shell lab -- claude   # Confine an agent's files, network and secrets
+h5i box export lab                                                    # Review its changes before they reach your repository
 ```
 
 <a href="https://trendshift.io/repositories/46160?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-46160" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/46160/daily?language=Rust" alt="h5i on Trendshift" width="250" height="55"/></a> 
@@ -73,7 +78,7 @@ Let AI agents explore, attack, and test web applications using h5i's integrated 
 
 > `h5i` CLI works with any web services regardless of their framework, and no migration to `h5i-app` is required.
 
-- **Browser automation:** Navigate applications, interact with forms, and test authenticated workflows.
+- **Browser automation:** Drive Chromium through h5i's capture proxy: navigate, fill forms, and test authenticated workflows, with every request policy-checked and recorded.
 - **HTTP security testing:** Capture, modify, replay, and compare HTTP requests to investigate vulnerabilities.
 - **Recon:** Discover endpoints, parameters, and hidden attack surfaces through crawling and JavaScript analysis.
 - **CI/CD:** Save confirmed attack flows and replay them in CI/CD to catch security regressions.
